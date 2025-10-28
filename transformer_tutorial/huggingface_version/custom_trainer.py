@@ -1,53 +1,98 @@
 """
 Hugging Face 기반 커스텀 트레이너 with Advanced Tracking
-"""
-import torch
-import torch.nn as nn
-from transformers import (
-    Trainer,
-    TrainingArguments,
-    AutoTokenizer,
-    DataCollatorForLanguageModeling,
-    EarlyStoppingCallback
-)
-from transformers.trainer_callback import TrainerCallback
-from transformers.trainer_utils import PredictionOutput
-from torch.utils.data import Dataset
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-import wandb
-from typing import Dict, List, Optional, Tuple, Any
-import os
-from datetime import datetime
 
-from .model import TrackedTransformerModel, TrackedTransformerConfig
+이 파일은 Hugging Face Trainer를 확장해서 Transformer 내부 상태를 추적하는 기능을 제공합니다.
+실무에서 모델을 분석하고 디버깅할 때 유용한 도구들을 포함하고 있습니다.
+
+주요 기능:
+1. Attention 가중치 실시간 추적
+2. 레이어별 출력 변화 모니터링  
+3. Gradient 흐름 분석
+4. WandB 통합 로깅
+5. 자동 시각화 및 저장
+6. Early Stopping 및 체크포인트 관리
+
+왜 커스텀 트레이너가 필요한가?
+- 기본 Trainer는 loss만 추적
+- 내부 상태는 Hook을 통해 수동으로 추출해야 함
+- 실무에서는 모델 해석성이 중요
+- 디버깅과 성능 분석을 위한 상세 정보 필요
+"""
+import torch  # PyTorch 기본
+import torch.nn as nn  # 신경망 모듈
+from transformers import (  # Hugging Face Transformers
+    Trainer,                        # 기본 트레이너 클래스
+    TrainingArguments,              # 훈련 설정
+    AutoTokenizer,                  # 자동 토크나이저
+    DataCollatorForLanguageModeling, # 언어 모델링용 데이터 콜레이터
+    EarlyStoppingCallback           # 조기 종료 콜백
+)
+from transformers.trainer_callback import TrainerCallback  # 콜백 기본 클래스
+from transformers.trainer_utils import PredictionOutput    # 예측 결과 형식
+from torch.utils.data import Dataset  # PyTorch 데이터셋
+import numpy as np  # 수치 계산
+import matplotlib.pyplot as plt  # 그래프 그리기
+import seaborn as sns  # 통계 시각화
+import wandb  # Weights & Biases - 실험 추적
+from typing import Dict, List, Optional, Tuple, Any  # 타입 힌트
+import os  # 파일 시스템
+from datetime import datetime  # 시간 처리
+
+from huggingface_version.model import TrackedTransformerModel, TrackedTransformerConfig
 
 
 class AttentionTrackingCallback(TrainerCallback):
     """
     Attention weight와 internal state를 추적하는 콜백
+    
+    이 클래스는 훈련 중에 모델의 내부 상태를 실시간으로 추적합니다.
+    Transformer의 각 레이어에서 일어나는 변화를 모니터링할 수 있습니다.
+    
+    추적하는 정보:
+    1. Attention 가중치 - 어떤 토큰에 집중하는지
+    2. 레이어별 출력 - 정보가 어떻게 변환되는지
+    3. Gradient 크기 - 학습이 제대로 되고 있는지
+    4. 통계량 변화 - mean, std, min, max 등
+    
+    사용법:
+    trainer = Trainer(...)
+    trainer.add_callback(AttentionTrackingCallback())
     """
     
     def __init__(self, save_dir: str = "attention_tracking", track_frequency: int = 100):
-        self.save_dir = save_dir
-        self.track_frequency = track_frequency
-        self.attention_history = []
-        self.layer_outputs_history = []
-        self.step_count = 0
+        """
+        Args:
+            save_dir: 추적 결과를 저장할 디렉토리
+            track_frequency: 몇 스텝마다 추적할지 (100이면 100스텝마다)
+        """
+        self.save_dir = save_dir  # 저장 경로
+        self.track_frequency = track_frequency  # 추적 빈도
+        self.attention_history = []  # attention 가중치 히스토리
+        self.layer_outputs_history = []  # 레이어 출력 히스토리
+        self.step_count = 0  # 현재 스텝 수
         
+        # 저장 디렉토리 생성
         os.makedirs(save_dir, exist_ok=True)
     
     def on_step_end(self, args, state, control, model=None, **kwargs):
-        """매 스텝마다 호출되는 콜백"""
+        """
+        매 스텝마다 호출되는 콜백 함수
+        
+        Hugging Face Trainer가 자동으로 호출합니다.
+        여기서 원하는 추적 로직을 구현할 수 있습니다.
+        """
         self.step_count += 1
         
-        # 일정 간격마다 추적
+        # 지정된 간격마다만 추적 (모든 스텝마다 하면 너무 느려짐)
         if self.step_count % self.track_frequency == 0:
             self._track_model_states(model, state.global_step)
     
     def _track_model_states(self, model, global_step):
-        """모델의 내부 상태 추적"""
+        """
+        모델의 내부 상태 추적
+        
+        이 함수가 실제로 모델 내부를 들여다보고 정보를 수집합니다.
+        """
         if hasattr(model, 'module'):  # DataParallel 처리
             model = model.module
         

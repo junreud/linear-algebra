@@ -1,39 +1,66 @@
 """
 Hugging Face 버전 Transformer 학습 스크립트
-"""
-import torch
-import torch.nn as nn
-from transformers import AutoTokenizer, DataCollatorForLanguageModeling
-from datasets import Dataset, load_dataset
-import argparse
-import os
-import wandb
-from typing import List, Dict
 
-from .model import create_tracked_transformer
-from .custom_trainer import (
-    CustomTransformerTrainer,
-    create_training_arguments,
-    SimpleTokenDataset
+이 파일은 Hugging Face 생태계를 활용한 실무형 Transformer 학습을 담당합니다.
+PyTorch 순정 구현과 달리, 다음과 같은 실무 기능들을 포함합니다:
+
+주요 특징:
+1. Hugging Face Trainer 사용 - 자동 최적화, 로깅, 체크포인트 저장
+2. WandB 통합 - 실험 추적 및 시각화
+3. 자동 토크나이저 - 텍스트 전처리 자동화
+4. 데이터셋 API - 효율적인 데이터 로딩
+5. Mixed Precision - 메모리 절약 및 속도 향상
+6. Gradient Accumulation - 큰 배치 사이즈 시뮬레이션
+"""
+import torch  # PyTorch 기본 라이브러리
+import torch.nn as nn  # 신경망 모듈들
+from transformers import AutoTokenizer, DataCollatorForLanguageModeling  # HF 토크나이저와 데이터 콜레이터
+from datasets import Dataset, load_dataset  # HF 데이터셋 라이브러리
+import argparse  # 명령행 인자 파싱
+import os  # 운영체제 인터페이스
+import wandb  # Weights & Biases - 실험 추적 도구
+from typing import List, Dict  # 타입 힌트
+
+# 우리가 만든 모듈들 가져오기
+from huggingface_version.model import create_tracked_transformer  # 커스텀 Transformer 모델
+from huggingface_version.custom_trainer import (  # 커스텀 트레이너 관련
+    CustomTransformerTrainer,    # 내부 상태 추적이 가능한 트레이너
+    create_training_arguments,   # 훈련 설정 생성 함수
+    SimpleTokenDataset          # 간단한 토큰 데이터셋
 )
 
 
 def create_simple_dataset(num_samples: int = 10000, vocab_size: int = 1000) -> Dataset:
     """
     간단한 언어 모델링 데이터셋 생성
-    실제로는 wikitext, openwebtext 등을 사용
+    
+    실무에서는 wikitext, openwebtext, C4 등의 대용량 텍스트 데이터를 사용하지만,
+    여기서는 학습 과정 이해를 위해 간단한 패턴 기반 데이터셋을 생성합니다.
+    
+    Args:
+        num_samples: 생성할 문장 수
+        vocab_size: 어휘 사전 크기 (실제로는 사용되지 않음, 호환성용)
+    
+    Returns:
+        HuggingFace Dataset 객체
+    
+    생성 과정:
+    1. 문장 템플릿 정의
+    2. 단어 목록 정의
+    3. 랜덤하게 조합해서 문장 생성
+    4. Dataset 형태로 반환
     """
     
-    # 간단한 템플릿 문장들
+    # 간단한 템플릿 문장들 - 실제 언어의 문법 구조를 간단히 모방
     templates = [
-        "The {animal} {verb} in the {location} during {time}.",
-        "A {adjective} {object} was {verb} by the {person}.",
-        "In the {location}, {person} {verb} {adjective} {object}.",
-        "During {time}, the {animal} {verb} {adjective}ly.",
-        "The {person} saw a {adjective} {animal} near the {location}.",
+        "The {animal} {verb} in the {location} during {time}.",      # 동물이 장소에서 시간에 행동
+        "A {adjective} {object} was {verb} by the {person}.",        # 형용사 물체가 사람에 의해 동사
+        "In the {location}, {person} {verb} {adjective} {object}.",  # 장소에서 사람이 형용사 물체를 동사
+        "During {time}, the {animal} {verb} {adjective}ly.",         # 시간에 동물이 형용사로 동사
+        "The {person} saw a {adjective} {animal} near the {location}.",  # 사람이 장소 근처에서 형용사 동물을 봄
     ]
     
-    # 단어 목록
+    # 각 카테고리별 단어 목록 - 실제 데이터의 다양성을 시뮬레이션
     words = {
         'animal': ['cat', 'dog', 'bird', 'fish', 'horse', 'tiger', 'lion', 'elephant'],
         'verb': ['runs', 'jumps', 'flies', 'swims', 'walks', 'sleeps', 'eats', 'plays'],
@@ -44,9 +71,9 @@ def create_simple_dataset(num_samples: int = 10000, vocab_size: int = 1000) -> D
         'person': ['Alice', 'Bob', 'Charlie', 'Diana', 'Eve', 'Frank', 'Grace', 'Henry']
     }
     
-    import random
+    import random  # 랜덤 조합을 위한 모듈
     
-    texts = []
+    texts = []  # 생성된 텍스트들을 저장할 리스트
     for _ in range(num_samples):
         template = random.choice(templates)
         

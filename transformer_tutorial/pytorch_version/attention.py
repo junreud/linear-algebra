@@ -47,17 +47,19 @@ class MultiHeadAttention(nn.Module):
         Forward pass with detailed tracking
         
         Args:
-            query: (batch_size, seq_len, d_model)
-            key: (batch_size, seq_len, d_model)
-            value: (batch_size, seq_len, d_model)
-            mask: (batch_size, seq_len, seq_len) or None
+            query: (batch_size, seq_len_q, d_model)
+            key: (batch_size, seq_len_k, d_model)
+            value: (batch_size, seq_len_v, d_model)
+            mask: (batch_size, seq_len_q, seq_len_k) or None
             return_attention: 어텐션 가중치 반환 여부
             
         Returns:
-            output: (batch_size, seq_len, d_model)
-            attention_weights: (batch_size, num_heads, seq_len, seq_len) if return_attention
+            output: (batch_size, seq_len_q, d_model)
+            attention_weights: (batch_size, num_heads, seq_len_q, seq_len_k) if return_attention
         """
-        batch_size, seq_len, d_model = query.shape
+        batch_size, seq_len_q, d_model = query.shape
+        seq_len_k = key.shape[1]
+        seq_len_v = value.shape[1]
         
         if self.debug:
             print(f"\n=== Multi-Head Attention Forward Pass ===")
@@ -65,9 +67,9 @@ class MultiHeadAttention(nn.Module):
             print(f"Model config - d_model: {self.d_model}, num_heads: {self.num_heads}, d_k: {self.d_k}")
         
         # 1. Linear transformations Q, K, V
-        Q = self.w_q(query)  # (batch_size, seq_len, d_model)
-        K = self.w_k(key)    # (batch_size, seq_len, d_model)
-        V = self.w_v(value)  # (batch_size, seq_len, d_model)
+        Q = self.w_q(query)  # (batch_size, seq_len_q, d_model)
+        K = self.w_k(key)    # (batch_size, seq_len_k, d_model)
+        V = self.w_v(value)  # (batch_size, seq_len_v, d_model)
         
         if self.debug:
             print(f"\n1. Linear Transformations:")
@@ -76,9 +78,9 @@ class MultiHeadAttention(nn.Module):
             print(f"V after W_v: {V.shape}, mean: {V.mean().item():.4f}, std: {V.std().item():.4f}")
         
         # 2. Reshape for multi-head: (batch_size, num_heads, seq_len, d_k)
-        Q = Q.view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
-        K = K.view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
-        V = V.view(batch_size, seq_len, self.num_heads, self.d_k).transpose(1, 2)
+        Q = Q.view(batch_size, seq_len_q, self.num_heads, self.d_k).transpose(1, 2)
+        K = K.view(batch_size, seq_len_k, self.num_heads, self.d_k).transpose(1, 2)
+        V = V.view(batch_size, seq_len_v, self.num_heads, self.d_k).transpose(1, 2)
         
         if self.debug:
             print(f"\n2. Reshape for Multi-Head:")
@@ -96,9 +98,9 @@ class MultiHeadAttention(nn.Module):
             print(f"Attention Weights: {attention_weights.shape}")
             print(f"Attention weight range: [{attention_weights.min().item():.4f}, {attention_weights.max().item():.4f}]")
         
-        # 4. Concatenate heads: (batch_size, seq_len, d_model)
+        # 4. Concatenate heads: (batch_size, seq_len_q, d_model)
         attention_output = attention_output.transpose(1, 2).contiguous().view(
-            batch_size, seq_len, self.d_model
+            batch_size, seq_len_q, self.d_model
         )
         
         if self.debug:

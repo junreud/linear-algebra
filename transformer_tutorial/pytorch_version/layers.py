@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, Dict
-from .attention import MultiHeadAttention
+from pytorch_version.attention import MultiHeadAttention
 
 
 class PositionalEncoding(nn.Module):

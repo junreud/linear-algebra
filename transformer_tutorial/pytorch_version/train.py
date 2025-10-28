@@ -14,7 +14,7 @@ import os
 import time
 from typing import List, Dict, Tuple
 
-from model import create_transformer_model
+from pytorch_version.model import create_transformer_model
 
 
 class SimpleTranslationDataset(Dataset):
@@ -218,7 +218,7 @@ class TransformerTrainer:
         if hasattr(self.model.encoder_layers[0].self_attention, 'debug_info'):
             debug_info = self.model.encoder_layers[0].self_attention.debug_info
             if 'attention_weights' in debug_info:
-                attention_weights = debug_info['attention_weights'][0, 0].cpu().numpy()  # 첫 번째 배치, 첫 번째 헤드
+                attention_weights = debug_info['attention_weights'][0, 0].cpu().detach().numpy()  # 첫 번째 배치, 첫 번째 헤드
                 
                 self.attention_weights_history.append({
                     'epoch': epoch,

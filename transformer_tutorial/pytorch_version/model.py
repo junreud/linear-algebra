@@ -7,8 +7,8 @@ import torch.nn.functional as F
 from typing import Optional, Tuple, Dict, List
 import math
 
-from .attention import MultiHeadAttention
-from .layers import (
+from pytorch_version.attention import MultiHeadAttention
+from pytorch_version.layers import (
     PositionalEncoding, 
     EncoderLayer, 
     DecoderLayer,
