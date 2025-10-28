@@ -1,1 +1,1 @@
-# linear-algebra
+# 선형대수학을 알아봐요!
