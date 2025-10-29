@@ -530,6 +530,7 @@ class TrackedTransformerModel(PreTrainedModel):
         if token_type_ids is None:
             token_type_ids = torch.zeros_like(input_ids)
         
+        # nn.Embedding 클래스의 __call__ 메서드가 벡터화를 함.
         word_embeddings = self.embeddings['word_embeddings'](input_ids)
         position_embeddings = self.embeddings['position_embeddings'](position_ids)
         token_type_embeddings = self.embeddings['token_type_embeddings'](token_type_ids)
@@ -544,14 +545,14 @@ class TrackedTransformerModel(PreTrainedModel):
             print(f"  Position embeddings: {position_embeddings.shape}, mean: {position_embeddings.mean().item():.4f}")
             print(f"  Combined embeddings: {embeddings.shape}, mean: {embeddings.mean().item():.4f}")
         
-        # 2. Attention mask preparation
+        # 2. Attention mask preparation, 패딩 토큰 무시
         if attention_mask is not None:
             attention_mask = self._prepare_attention_mask(attention_mask)
         
         # 3. Transformer layers
-        hidden_states = embeddings
-        all_hidden_states = () if output_hidden_states else None
-        all_attentions = () if output_attentions else None
+        hidden_states = embeddings          # 임베딩을 첫 번째 입력으로 설정
+        all_hidden_states = () if output_hidden_states else None    # 각 레이어 출력 저장용
+        all_attentions = () if output_attentions else None          # 각 레이어 attention 저장용
         
         for i, layer in enumerate(self.layers):
             if output_hidden_states:
@@ -578,9 +579,9 @@ class TrackedTransformerModel(PreTrainedModel):
             return tuple(v for v in [hidden_states, all_hidden_states, all_attentions] if v is not None)
         
         return BaseModelOutput(
-            last_hidden_state=hidden_states,
-            hidden_states=all_hidden_states,
-            attentions=all_attentions,
+            last_hidden_state=hidden_states,      # 최종 레이어 출력
+            hidden_states=all_hidden_states,      # 모든 레이어 출력 (선택적)
+            attentions=all_attentions,            # 모든 attention 가중치 (선택적)
         )
 
 

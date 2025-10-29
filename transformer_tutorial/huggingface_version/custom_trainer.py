@@ -8,7 +8,7 @@ Hugging Face 기반 커스텀 트레이너 with Advanced Tracking
 1. Attention 가중치 실시간 추적
 2. 레이어별 출력 변화 모니터링  
 3. Gradient 흐름 분석
-4. WandB 통합 로깅
+4. WandB 통합 로깅 || wandB: 머신러닝 실험을 추적하고 시각화하기 위한 툴
 5. 자동 시각화 및 저장
 6. Early Stopping 및 체크포인트 관리
 
