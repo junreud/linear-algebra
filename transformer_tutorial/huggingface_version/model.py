@@ -57,7 +57,8 @@ class TrackedTransformerConfig(PretrainedConfig):
         initializer_range: float = 0.02,            # 가중치 초기화 범위 (정규분포의 표준편차)
         layer_norm_eps: float = 1e-12,              # LayerNorm의 epsilon 값 (0으로 나누는 것 방지)
         pad_token_id: int = 0,                      # 패딩 토큰 ID - 짧은 문장을 길게 만들 때 사용
-        position_embedding_type: str = "absolute",  # 위치 임베딩 타입 (absolute/relative)
+        position_embedding_type: str = "rope",     # 위치 임베딩 타입 (absolute/rope)
+        rope_theta: float = 10000.0,                # RoPE의 기본 주파수 (theta)
         track_internal_states: bool = True,         # 내부 상태 추적 여부 - 우리만의 커스텀 옵션
         **kwargs  # 추가적인 설정들을 받기 위한 매개변수
     ):
@@ -78,6 +79,7 @@ class TrackedTransformerConfig(PretrainedConfig):
         self.initializer_range = initializer_range                        # 가중치 초기화 범위
         self.layer_norm_eps = layer_norm_eps                              # LayerNorm epsilon
         self.position_embedding_type = position_embedding_type            # 위치 임베딩 타입
+        self.rope_theta = rope_theta                                      # RoPE 기본 주파수
         self.track_internal_states = track_internal_states                # 내부 상태 추적 여부
 
 
@@ -127,6 +129,14 @@ class TrackedAttention(nn.Module):
         # Attention 가중치에 적용할 드롭아웃 - 과적합 방지 및 일반화 성능 향상
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
         
+        # RoPE를 위한 설정
+        self.position_embedding_type = config.position_embedding_type
+        if self.position_embedding_type == "rope":
+            self.rope_theta = config.rope_theta
+            # RoPE 주파수 계산: 각 차원별로 다른 주파수 사용
+            inv_freq = 1.0 / (self.rope_theta ** (torch.arange(0, self.attention_head_size, 2).float() / self.attention_head_size))
+            self.register_buffer("inv_freq", inv_freq, persistent=False)
+        
         # 내부 상태 추적을 위한 딕셔너리 - 디버깅 및 분석용
         self.tracked_states = {}
         
@@ -150,6 +160,82 @@ class TrackedAttention(nn.Module):
         x = x.view(new_x_shape)
         # 차원 순서 변경: 헤드 차원을 앞으로 이동
         return x.permute(0, 2, 1, 3)  # (batch_size, num_heads, seq_len, head_size)
+    
+    def get_rope_cache(self, seq_len: int, device: torch.device, dtype: torch.dtype):
+        """
+        RoPE를 위한 cos, sin 캐시 생성
+        
+        Args:
+            seq_len: 시퀀스 길이
+            device: 텐서 디바이스
+            dtype: 텐서 타입
+            
+        Returns:
+            cos, sin: 회전 변환을 위한 cos, sin 값들
+        """
+        if self.position_embedding_type != "rope":
+            return None, None
+            
+        # 위치 인덱스 생성 [0, 1, 2, ..., seq_len-1]
+        position_ids = torch.arange(seq_len, device=device, dtype=torch.long)
+        
+        # 주파수와 위치의 외적으로 각도 계산
+        # position_ids: [seq_len], inv_freq: [head_size//2]
+        # freqs: [seq_len, head_size//2]
+        freqs = torch.outer(position_ids.float(), self.inv_freq)
+        
+        # cos, sin 값 계산 후 차원 복제 (실수부, 허수부 쌍 만들기)
+        # [seq_len, head_size//2] -> [seq_len, head_size]
+        cos = torch.cos(freqs).repeat_interleave(2, dim=-1)
+        sin = torch.sin(freqs).repeat_interleave(2, dim=-1)
+        
+        return cos.to(dtype), sin.to(dtype)
+    
+    def rotate_half(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        RoPE를 위한 벡터 회전 함수
+        
+        복소수 회전을 시뮬레이션하기 위해 벡터의 전반부와 후반부를 교체하고 부호 변경
+        [x1, x2, x3, x4] -> [-x3, -x4, x1, x2]
+        
+        Args:
+            x: 입력 텐서 (..., head_size)
+            
+        Returns:
+            회전된 텐서
+        """
+        x1 = x[..., : x.shape[-1] // 2]  # 전반부
+        x2 = x[..., x.shape[-1] // 2 :]  # 후반부
+        return torch.cat((-x2, x1), dim=-1)  # 후반부에 -1 곱하고 순서 바꿈
+    
+    def apply_rotary_pos_emb(self, q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Query와 Key에 Rotary Position Embedding 적용
+        
+        수식: q_embed = q * cos + rotate_half(q) * sin
+        
+        Args:
+            q: Query 텐서 (batch, heads, seq_len, head_size)
+            k: Key 텐서 (batch, heads, seq_len, head_size)  
+            cos: cosine 값들 (seq_len, head_size)
+            sin: sine 값들 (seq_len, head_size)
+            
+        Returns:
+            회전 변환이 적용된 q, k
+        """
+        if cos is None or sin is None:
+            return q, k
+            
+        # cos, sin을 q, k와 같은 차원으로 확장
+        # (seq_len, head_size) -> (1, 1, seq_len, head_size)
+        cos = cos.unsqueeze(0).unsqueeze(0)  
+        sin = sin.unsqueeze(0).unsqueeze(0)
+        
+        # 회전 변환 적용: 복소수 곱셈을 실수 연산으로 구현
+        q_embed = (q * cos) + (self.rotate_half(q) * sin)
+        k_embed = (k * cos) + (self.rotate_half(k) * sin)
+        
+        return q_embed, k_embed
     
     def forward(
         self,
@@ -198,6 +284,17 @@ class TrackedAttention(nn.Module):
             print(f"Q reshaped: {query_layer.shape}")
             print(f"K reshaped: {key_layer.shape}")
             print(f"V reshaped: {value_layer.shape}")
+        
+        # 2.5. Apply Rotary Position Embedding (RoPE) - 새로운 위치 임베딩 방식!
+        if self.position_embedding_type == "rope":
+            seq_len = hidden_states.shape[1]
+            cos, sin = self.get_rope_cache(seq_len, hidden_states.device, hidden_states.dtype)
+            query_layer, key_layer = self.apply_rotary_pos_emb(query_layer, key_layer, cos, sin)
+            
+            if self.track_internal_states:
+                print(f"RoPE applied to Q and K!")
+                print(f"Q after RoPE: mean = {query_layer.mean().item():.4f}")
+                print(f"K after RoPE: mean = {key_layer.mean().item():.4f}")
         
         # 3. Compute attention scores (Q × K^T)
         # 각 Query가 모든 Key와 얼마나 유사한지 계산 - 이것이 attention의 핵심!
@@ -465,9 +562,15 @@ class TrackedTransformerModel(PreTrainedModel):
         # Embeddings
         self.embeddings = nn.ModuleDict({
             'word_embeddings': nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id),
-            'position_embeddings': nn.Embedding(config.max_position_embeddings, config.hidden_size),
             'token_type_embeddings': nn.Embedding(config.type_vocab_size, config.hidden_size),
         })
+        
+        # 위치 임베딩: RoPE vs Absolute 방식 선택
+        if config.position_embedding_type == "absolute":
+            # 기존 방식: 학습 가능한 위치 임베딩 테이블
+            self.embeddings['position_embeddings'] = nn.Embedding(config.max_position_embeddings, config.hidden_size)
+        # RoPE 방식에서는 별도의 위치 임베딩 테이블 불필요 (Attention에서 직접 처리)
+        
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         
@@ -532,18 +635,33 @@ class TrackedTransformerModel(PreTrainedModel):
         
         # nn.Embedding 클래스의 __call__ 메서드가 벡터화를 함.
         word_embeddings = self.embeddings['word_embeddings'](input_ids)
-        position_embeddings = self.embeddings['position_embeddings'](position_ids)
         token_type_embeddings = self.embeddings['token_type_embeddings'](token_type_ids)
         
-        embeddings = word_embeddings + position_embeddings + token_type_embeddings
+        # 위치 임베딩 처리: RoPE vs Absolute
+        if self.config.position_embedding_type == "absolute":
+            # 기존 방식: 위치 임베딩을 입력 단계에서 더함
+            position_embeddings = self.embeddings['position_embeddings'](position_ids)
+            embeddings = word_embeddings + position_embeddings + token_type_embeddings
+            
+            if self.config.track_internal_states:
+                print(f"\n[ABSOLUTE PE] Embeddings:")
+                print(f"  Word embeddings: {word_embeddings.shape}, mean: {word_embeddings.mean().item():.4f}")
+                print(f"  Position embeddings: {position_embeddings.shape}, mean: {position_embeddings.mean().item():.4f}")
+                print(f"  Combined embeddings: {embeddings.shape}, mean: {embeddings.mean().item():.4f}")
+                
+        elif self.config.position_embedding_type == "rope":
+            # RoPE 방식: 위치 정보는 Attention에서 처리, 여기서는 단어+타입만
+            embeddings = word_embeddings + token_type_embeddings
+            
+            if self.config.track_internal_states:
+                print(f"\n[RoPE] Embeddings (no position embedding added here):")
+                print(f"  Word embeddings: {word_embeddings.shape}, mean: {word_embeddings.mean().item():.4f}")
+                print(f"  Token type embeddings: {token_type_embeddings.shape}, mean: {token_type_embeddings.mean().item():.4f}")
+                print(f"  Combined embeddings: {embeddings.shape}, mean: {embeddings.mean().item():.4f}")
+                print(f"  Position info will be applied in attention layers via RoPE!")
+        
         embeddings = self.LayerNorm(embeddings)
         embeddings = self.dropout(embeddings)
-        
-        if self.config.track_internal_states:
-            print(f"\nEmbeddings:")
-            print(f"  Word embeddings: {word_embeddings.shape}, mean: {word_embeddings.mean().item():.4f}")
-            print(f"  Position embeddings: {position_embeddings.shape}, mean: {position_embeddings.mean().item():.4f}")
-            print(f"  Combined embeddings: {embeddings.shape}, mean: {embeddings.mean().item():.4f}")
         
         # 2. Attention mask preparation, 패딩 토큰 무시
         if attention_mask is not None:
@@ -585,11 +703,93 @@ class TrackedTransformerModel(PreTrainedModel):
         )
 
 
+def test_tracked_transformer():
+    """Test the tracked transformer model with both position embedding types"""
+    print("=== Tracked Transformer Test (RoPE vs Absolute PE) ===")
+    
+    # Test data
+    batch_size, seq_len = 2, 10
+    input_ids = torch.randint(1, 1000, (batch_size, seq_len))
+    attention_mask = torch.ones_like(input_ids)
+    
+    print(f"Input shape: {input_ids.shape}")
+    
+    # Test 1: RoPE 방식
+    print(f"\n{'='*60}")
+    print("Testing RoPE (Rotary Position Embedding)")
+    print(f"{'='*60}")
+    
+    model_rope = create_tracked_transformer(
+        vocab_size=1000,
+        hidden_size=256,
+        num_layers=2,
+        num_heads=8,
+        position_embedding_type="rope",
+        track_internal_states=True
+    )
+    
+    print(f"RoPE Model parameters: {sum(p.numel() for p in model_rope.parameters()):,}")
+    
+    outputs_rope = model_rope(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        output_attentions=True,
+        output_hidden_states=True
+    )
+    
+    print(f"\nRoPE Output shapes:")
+    print(f"Last hidden state: {outputs_rope.last_hidden_state.shape}")
+    print(f"Final output mean: {outputs_rope.last_hidden_state.mean().item():.4f}")
+    
+    # Test 2: Absolute PE 방식 (기존)
+    print(f"\n{'='*60}")
+    print("Testing Absolute Position Embedding (Traditional)")
+    print(f"{'='*60}")
+    
+    model_abs = create_tracked_transformer(
+        vocab_size=1000,
+        hidden_size=256,
+        num_layers=2,
+        num_heads=8,
+        position_embedding_type="absolute",
+        track_internal_states=True
+    )
+    
+    print(f"Absolute PE Model parameters: {sum(p.numel() for p in model_abs.parameters()):,}")
+    
+    outputs_abs = model_abs(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        output_attentions=True,
+        output_hidden_states=True
+    )
+    
+    print(f"\nAbsolute PE Output shapes:")
+    print(f"Last hidden state: {outputs_abs.last_hidden_state.shape}")
+    print(f"Final output mean: {outputs_abs.last_hidden_state.mean().item():.4f}")
+    
+    # 비교 결과
+    print(f"\n{'='*60}")
+    print("Comparison Results")
+    print(f"{'='*60}")
+    print(f"Parameter difference: {sum(p.numel() for p in model_abs.parameters()) - sum(p.numel() for p in model_rope.parameters()):,}")
+    print("(Absolute PE has more parameters due to position embedding table)")
+    
+    # Check attention patterns
+    rope_attention = outputs_rope.attentions[0]
+    abs_attention = outputs_abs.attentions[0]
+    print(f"RoPE attention shape: {rope_attention.shape}")
+    print(f"Absolute attention shape: {abs_attention.shape}")
+    print(f"RoPE attention sum: {rope_attention.sum(dim=-1).mean().item():.4f}")
+    print(f"Absolute attention sum: {abs_attention.sum(dim=-1).mean().item():.4f}")
+
+
 def create_tracked_transformer(
     vocab_size: int = 30522,
     hidden_size: int = 512,
     num_layers: int = 6,
     num_heads: int = 8,
+    position_embedding_type: str = "rope",  # 기본값을 RoPE로 변경
     track_internal_states: bool = True
 ) -> TrackedTransformerModel:
     """Create a tracked transformer model"""
@@ -600,51 +800,12 @@ def create_tracked_transformer(
         num_hidden_layers=num_layers,
         num_attention_heads=num_heads,
         intermediate_size=hidden_size * 4,
+        position_embedding_type=position_embedding_type,
         track_internal_states=track_internal_states
     )
     
     model = TrackedTransformerModel(config)
     return model
-
-
-def test_tracked_transformer():
-    """Test the tracked transformer model"""
-    print("=== Tracked Transformer Test ===")
-    
-    # Create model
-    model = create_tracked_transformer(
-        vocab_size=1000,
-        hidden_size=256,
-        num_layers=2,
-        num_heads=8,
-        track_internal_states=True
-    )
-    
-    # Test data
-    batch_size, seq_len = 2, 10
-    input_ids = torch.randint(1, 1000, (batch_size, seq_len))
-    attention_mask = torch.ones_like(input_ids)
-    
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
-    print(f"Input shape: {input_ids.shape}")
-    
-    # Forward pass
-    outputs = model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        output_attentions=True,
-        output_hidden_states=True
-    )
-    
-    print(f"\nOutput shapes:")
-    print(f"Last hidden state: {outputs.last_hidden_state.shape}")
-    print(f"Hidden states: {len(outputs.hidden_states)} layers")
-    print(f"Attentions: {len(outputs.attentions)} layers")
-    
-    # Check attention patterns
-    first_layer_attention = outputs.attentions[0]  # (batch_size, num_heads, seq_len, seq_len)
-    print(f"First layer attention shape: {first_layer_attention.shape}")
-    print(f"Attention sum per position: {first_layer_attention.sum(dim=-1).mean().item():.4f} (should be ~1.0)")
 
 
 if __name__ == "__main__":

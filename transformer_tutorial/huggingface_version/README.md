@@ -21,10 +21,7 @@
 huggingface_version/
 ├── README.md                        # 이 파일
 ├── encoder_decoder_model.py         # BERT+Transformer 하이브리드 모델
-├── train_encoder_decoder.py         # 기본 훈련 스크립트 (하드코딩 데이터)
 ├── train_encoder_decoder_hf.py      # HuggingFace 데이터셋 훈련 스크립트
-├── test_encoder_decoder.py          # 모델 테스트
-├── test_hf_training.py              # HuggingFace 훈련 테스트
 ├── custom_trainer.py               # 커스텀 훈련기
 ├── model.py                        # 기본 모델들
 └── train.py                        # 기본 훈련 스크립트
